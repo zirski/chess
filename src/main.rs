@@ -6,6 +6,7 @@ use core::fmt;
 use std::{
     fs::File,
     io::{BufRead, BufReader},
+    os::fd::OwnedFd,
 };
 
 const BOARD_SIZE: usize = 8;
@@ -15,12 +16,6 @@ enum MoveError {
     InvalidSource,
     InvalidDest,
     Check,
-}
-
-enum Dir {
-    neg,
-    null,
-    pos,
 }
 
 impl fmt::Display for MoveError {
@@ -37,57 +32,130 @@ impl std::error::Error for MoveError {}
 
 struct Game {
     board: Vec<Vec<Tile>>,
+    white_king: Option<Tile>,
+    black_king: Option<Tile>,
+    is_start: Option<Owner>,
 }
 
 impl Game {
     fn build_game() -> Game {
         let mut new = Game {
             board: vec![vec![Tile::blank(); BOARD_SIZE]; BOARD_SIZE],
+            white_king: None,
+            black_king: None,
+            is_start: Some(Owner::White),
         };
         new.init();
         new
     }
 
-    fn general_move(pos: (usize, usize), dir: (Dir, Dir), dist: (usize, usize)) -> (usize, usize) {
-        let mut new_pos = pos;
-        new_pos.0 = match dir.0 {
-            Dir::neg => pos.0 - dist.0,
-            Dir::null => pos.0,
-            Dir::pos => pos.0 + dist.0,
-        };
-        new_pos.1 = match dir.1 {
-            Dir::neg => pos.1 - dist.1,
-            Dir::null => pos.1,
-            Dir::pos => pos.1 + dist.1,
-        };
-        new_pos
+    //
+    fn general_move(src: (usize, usize), shift: (i32, i32)) -> (usize, usize) {
+        let mut new_pos = (src.0 as i32, src.1 as i32);
+        new_pos.0 += shift.0;
+        new_pos.1 += shift.1;
+        (new_pos.0 as usize, new_pos.1 as usize)
     }
 
     fn calc_moves(&mut self, pos: (usize, usize)) {
-        let mut tile = self.get_mut_tile(pos).expect("pos should be a valid index");
-        let piece = &tile.piece.expect("Tile shouldn't be empty");
-        // Defined moves
-        let r = |p| -> (usize, usize) { Game::general_move(p, (Dir::pos, Dir::null), (1, 0)) };
-        let l = |p| -> (usize, usize) { Game::general_move(p, (Dir::neg, Dir::null), (1, 0)) };
-        let d = |p| -> (usize, usize) { Game::general_move(p, (Dir::null, Dir::pos), (0, 1)) };
-        let u = |p| -> (usize, usize) { Game::general_move(p, (Dir::null, Dir::neg), (0, 1)) };
-        // Diagonal functions - up-right, up-left, down-right, down-left
-        let dur = |p| -> (usize, usize) { Game::general_move(p, (Dir::pos, Dir::neg), (1, 1)) };
-        let dul = |p| -> (usize, usize) { Game::general_move(p, (Dir::neg, Dir::neg), (1, 1)) };
-        let ddr = |p| -> (usize, usize) { Game::general_move(p, (Dir::pos, Dir::pos), (1, 1)) };
-        let ddl = |p| -> (usize, usize) { Game::general_move(p, (Dir::neg, Dir::pos), (1, 1)) };
+        let src_tile = self.get_tile(pos).expect("pos should be a valid index");
+        let piece = src_tile.piece.as_ref().expect("tile shouldn't be empty");
+        let mut new_moves: Vec<(usize, usize)> = Vec::new();
         match piece {
-            Piece::Pawn => {}
-            Piece::Rook => {
-                let move_fns: Vec<&dyn Fn((usize, usize)) -> (usize, usize)> = vec![&r, &l, &d, &u];
-                for func in move_fns {
-                    let test_tile = self.get_mut_tile(func(tile.pos));
+            Piece::Pawn => {
+                let owner = src_tile.owner.as_ref().expect("tile shouldn't be empty");
+                let shift = match owner {
+                    Owner::Black => 1,
+                    Owner::White => -1,
+                };
+                let pawn_moves = vec![
+                    Game::general_move(src_tile.pos, (0, shift)),
+                    Game::general_move(src_tile.pos, (0, shift + 1)),
+                ];
+                let take_moves = vec![
+                    Game::general_move(src_tile.pos, (-1, shift)),
+                    Game::general_move(src_tile.pos, (1, shift)),
+                ];
+                for m in pawn_moves {
+                    if self.get_tile(m).is_some_and(|t| t.owner != src_tile.owner) {
+                        new_moves.push(m);
+                    }
                 }
-                // conditions: new tile needs to be in-bounds (stop when it's not)
-                // conditions2: stop when you encounter another piece (if member of opposing side, include;
-                // if not, dont)
+                for m in take_moves {
+                    let move_tile = self.get_tile(m);
+                    if move_tile.is_some_and(|t| t.owner.clone().is_some_and(|o| &o != owner)) {
+                        new_moves.push(m);
+                    }
+                }
+            }
+            Piece::Knight => {
+                let knight_moves = vec![
+                    Game::general_move(src_tile.pos, (1, 2)),
+                    Game::general_move(src_tile.pos, (2, 1)),
+                    Game::general_move(src_tile.pos, (-1, 2)),
+                    Game::general_move(src_tile.pos, (-2, 1)),
+                    Game::general_move(src_tile.pos, (1, -2)),
+                    Game::general_move(src_tile.pos, (2, -1)),
+                    Game::general_move(src_tile.pos, (-1, -2)),
+                    Game::general_move(src_tile.pos, (-2, -1)),
+                ];
+                for m in knight_moves {
+                    if self.get_tile(m).is_some_and(|t| t.owner != src_tile.owner) {
+                        new_moves.push(m);
+                    }
+                }
+            }
+            Piece::King => {
+                let king_moves = vec![
+                    Game::general_move(src_tile.pos, (-1, -1)),
+                    Game::general_move(src_tile.pos, (0, -1)),
+                    Game::general_move(src_tile.pos, (1, -1)),
+                    Game::general_move(src_tile.pos, (-1, 0)),
+                    Game::general_move(src_tile.pos, (1, 0)),
+                    Game::general_move(src_tile.pos, (-1, 1)),
+                    Game::general_move(src_tile.pos, (0, 1)),
+                    Game::general_move(src_tile.pos, (1, 1)),
+                ];
+
+                for m in king_moves {
+                    if self.get_tile(m).is_some_and(|t| t.owner != src_tile.owner) {
+                        new_moves.push(m);
+                    }
+                }
+            }
+            other => {
+                let r = |p| -> (usize, usize) { Game::general_move(p, (1, 0)) };
+                let l = |p| -> (usize, usize) { Game::general_move(p, (-1, 0)) };
+                let d = |p| -> (usize, usize) { Game::general_move(p, (0, 1)) };
+                let u = |p| -> (usize, usize) { Game::general_move(p, (0, -1)) };
+                // Diagonal functions - up-right, up-left, down-right, down-left
+                let dur = |p| -> (usize, usize) { Game::general_move(p, (1, -1)) };
+                let dul = |p| -> (usize, usize) { Game::general_move(p, (-1, -1)) };
+                let ddr = |p| -> (usize, usize) { Game::general_move(p, (1, 1)) };
+                let ddl = |p| -> (usize, usize) { Game::general_move(p, (-1, 1)) };
+
+                let move_fns: Vec<&dyn Fn((usize, usize)) -> (usize, usize)> = match other {
+                    Piece::Rook => vec![&r, &l, &d, &u],
+                    Piece::Bishop => vec![&dur, &dul, &ddr, &ddl],
+                    _ => vec![&r, &l, &d, &u, &dur, &dul, &ddr, &ddl],
+                };
+                for func in move_fns {
+                    let mut pos = func(src_tile.pos);
+                    while let Some(tile) = self.get_tile(pos) {
+                        if tile.owner.is_none() {
+                            new_moves.push(pos);
+                        } else if tile.owner.is_some() && tile.owner == src_tile.owner {
+                            break;
+                        } else {
+                            new_moves.push(pos);
+                            break;
+                        }
+                        pos = func(pos);
+                    }
+                }
             }
         }
+        self.get_mut_tile(pos).unwrap().moves = new_moves;
     }
 
     // the choice of indexing into a tile vs a piece seems arbitrary, so I'm going to choose the thing I
@@ -100,10 +168,16 @@ impl Game {
         self.board.get_mut(pos.0).and_then(|x| x.get_mut(pos.1))
     }
 
-    // Moves desired piece. Makes no checks.
+    // Moves desired piece. Assumes src tile carries a piece.
     fn move_piece(&mut self, src: (usize, usize), dest: (usize, usize)) {
-        let src_piece = self.board[src.0][src.1].piece.take();
-        self.board[dest.0][dest.1].piece = src_piece;
+        let src_piece = self
+            .get_mut_tile(src)
+            .expect("src should be a valid index")
+            .piece
+            .take();
+        self.get_mut_tile(dest)
+            .expect("dest should be a valid index")
+            .piece = src_piece;
     }
 
     // Assumes valid src and dest indices
@@ -112,17 +186,22 @@ impl Game {
         src: (usize, usize),
         dest: (usize, usize),
     ) -> Result<(), MoveError> {
-        let src_tile = self.get_tile(src).expect("src should be a valid index");
-        match &src_tile.piece {
-            Some(src_piece) => {
-                // if src_piece.calculate_raw_moves(src).contains(&dest) {
-                //     self.move_piece(src, dest);
-                //     Ok(())
-                // } else {
-                //     Err(MoveError::InvalidDest)
-                // }
+        self.calc_moves(src);
+        let src_tile = self.get_mut_tile(src).expect("src should be a valid index");
+        if src_tile.piece.is_some() {
+            if src_tile.moves.contains(&dest) {
+                self.move_piece(src, dest);
+                self.is_start = match self.is_start {
+                    Some(Owner::White) => Some(Owner::Black),
+                    Some(Owner::Black) => None,
+                    None => None,
+                };
+                Ok(())
+            } else {
+                Err(MoveError::InvalidDest)
             }
-            None => Err(MoveError::InvalidSource),
+        } else {
+            Err(MoveError::InvalidSource)
         }
     }
     // Load all pieces from csv file
@@ -191,82 +270,6 @@ enum Owner {
     White,
 }
 
-impl Piece {
-    // Calculates moves only with regard to individual piece's movement rules
-    // TODO: I wonder if I can simplify this with iterator methods?
-    // fn calculate_raw_moves(&self, pos: (usize, usize)) -> Vec<(usize, usize)> {
-    //     let mut moves: Vec<(usize, usize)> = Vec::new();
-    //     // Defines reused behaviors for several pieces; code 0 is for horizontal
-    //     // and vertical movement, code 1 for diagonals
-    //     let mut large_move = |x: usize| {
-    //         if x == 0 {
-    //             for i in 0..BOARD_SIZE {
-    //                 moves.push((pos.0, i));
-    //                 moves.push((i, pos.1));
-    //             }
-    //         } else {
-    //             for i in 0..BOARD_SIZE {
-    //                 moves.push((i, i));
-    //                 moves.push((BOARD_SIZE - i, i));
-    //             }
-    //         }
-    //     };
-    //     match self {
-    //         // TODO: add logic for start-of-game condition (able to move 2 in
-    //         // positive y)
-    //         Piece::Pawn => {
-    //             moves.push((pos.0, pos.1 + 1));
-    //         }
-    //         Piece::Rook => {
-    //             large_move(0);
-    //         }
-    //         Piece::Knight => {
-    //             let list: Vec<(i32, i32)> = vec![
-    //                 (1, 2),
-    //                 (2, 1),
-    //                 (-1, -2),
-    //                 (-2, -1),
-    //                 (-1, 2),
-    //                 (-2, 1),
-    //                 (1, -2),
-    //                 (2, -1),
-    //             ];
-    //             for i in list {
-    //                 moves.push((pos.0 + i.0 as usize, pos.1 + i.1 as usize));
-    //             }
-    //         }
-    //         Piece::Bishop => {
-    //             large_move(1);
-    //         }
-    //         Piece::Queen => {
-    //             large_move(0);
-    //             large_move(1);
-    //         }
-    //         Piece::King => {
-    //             let list: Vec<(i32, i32)> = vec![
-    //                 (-1, -1),
-    //                 (-1, 0),
-    //                 (-1, 1),
-    //                 (0, -1),
-    //                 (0, 0),
-    //                 (0, 1),
-    //                 (1, -1),
-    //                 (1, 0),
-    //                 (1, 1),
-    //             ];
-    //             for i in list {
-    //                 moves.push((pos.0 + i.0 as usize, pos.1 + i.1 as usize));
-    //             }
-    //         }
-    //     }
-    //     // cleanses list of current position as well as out-of-bounds positions
-    //     moves.retain(|x| {
-    //         (x != &pos) & (x.0 > 0) & (x.1 > 0) & (x.0 < BOARD_SIZE) & (x.1 < BOARD_SIZE)
-    //     });
-    //     moves
-    // }
-}
-// a movable container for a piece (which could not exist) and a "shade"... wait
 // Tile shouldn't really ever be cloned, except during board creation
 #[derive(Clone)]
 struct Tile {
